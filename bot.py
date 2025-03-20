@@ -1,32 +1,41 @@
-
 import os
 import openai
-import sqlite3
+import requests
 import pytesseract
-import csv
 import json
-from telegram.ext import CallbackQueryHandler
+import psycopg2
+import csv
+import logging
 from PIL import Image
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from telegram import Update, WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import CommandHandler, CallbackContext
+from aiogram import Bot, Dispatcher, types
+import asyncio
+import boto3
 
-# API-ключи (ОСТАВЛЯЕМ В КОДЕ ДЛЯ ОТЛАДКИ)
-OPENAI_API_KEY = "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"
-TELEGRAM_BOT_TOKEN = "7624151350:AAGC3EYYMV3KMkQtbVlRApMTOks5cG77kxE"
+# Настройки логирования
+logging.basicConfig(level=logging.INFO)
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+# API-ключи (Теперь берутся из переменных окружения)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Подключаем базу данных SQLite
-conn = sqlite3.connect("receipts.db", check_same_thread=False)
+# Инициализация бота
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+dp = Dispatcher(bot)
+
+# Подключение к Supabase (PostgreSQL)
+conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
-# Создаем таблицу для чеков
+# Создаем таблицу для чеков (если ее нет)
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS receipts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT,
     item TEXT,
     quantity INTEGER,
     price REAL
@@ -34,104 +43,102 @@ CREATE TABLE IF NOT EXISTS receipts (
 ''')
 conn.commit()
 
+# Инициализация Cloudflare R2
+s3_client = boto3.client(
+    "s3",
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY
+)
+
+# Функция обработки запросов к ChatGPT
+async def chatgpt_request(prompt):
+    openai.api_key = OPENAI_API_KEY
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response["choices"][0]["message"]["content"]
+
 # Главное меню
 def get_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("📸 Сканировать чек", callback_data="scan_receipt")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    keyboard = [[types.InlineKeyboardButton("📸 Сканировать чек", callback_data="scan_receipt")]]
+    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-# Обработчик /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь фото чека, и я обработаю его.", reply_markup=get_main_menu())
+# Обработчик команды /start
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
+    await message.reply("Привет! Отправь фото чека, и я обработаю его.", reply_markup=get_main_menu())
 
 # Обработчик кнопки "Сканировать чек"
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text("Отправьте фото чека.")
+@dp.callback_query_handler(lambda query: query.data == "scan_receipt")
+async def button_handler(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer("Отправьте фото чека.")
 
 # Обработчик изображений (анализ чека)
-async def process_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    photo = await update.message.photo[-1].get_file()
-    
-    file_path = f"receipt_{user_id}.jpg"
-    await photo.download_to_drive(file_path)
+@dp.message_handler(content_types=types.ContentType.PHOTO)
+async def process_receipt(message: types.Message):
+    user_id = message.from_user.id
+    photo = await bot.get_file(message.photo[-1].file_id)
 
-    # Распознаем текст с изображения (добавили поддержку русского)
+    file_path = f"receipt_{user_id}.jpg"
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{photo.file_path}"
+
+    # Скачиваем изображение
+    response = requests.get(file_url)
+    with open(file_path, "wb") as f:
+        f.write(response.content)
+
+    # Распознаем текст с изображения (русский и английский)
     image = Image.open(file_path)
     text = pytesseract.image_to_string(image, lang="rus+eng")
 
-    # GPT-4o анализирует чек
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Extract items, quantity, and price from the receipt. Return data ONLY as CSV in format: 'Item, Quantity, Price' without any additional text or explanations."},
-            {"role": "user", "content": text}
-        ]
-    )
+    # Отправляем в ChatGPT для структурирования
+    response = await chatgpt_request(f"Extract items, quantity, and price from this receipt:\n{text}")
+    structured_data = response.strip()
 
-    structured_data = response.choices[0].message.content
+    # Загружаем изображение в Cloudflare R2
+    r2_file_name = f"{user_id}/{photo.file_id}.jpg"
+    s3_client.put_object(Bucket=R2_BUCKET_NAME, Key=r2_file_name, Body=open(file_path, "rb"))
 
-async def send_form(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("📝 Заполнить чек", web_app=WebAppInfo("https://chekhotskiy.github.io/"))]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    file_link = f"https://{R2_BUCKET_NAME}.r2.dev/{r2_file_name}"
+    await message.reply(f"✅ Чек сохранен: {file_link}")
 
-    await update.message.reply_text("Заполните чек:", reply_markup=reply_markup)
-
-async def handle_webapp_data(update: Update, context: CallbackContext):
-    query = update.callback_query
-    data = query.web_app_data.data  # JSON-данные
-
-    # Декодируем JSON
-    receipt = json.loads(data)
-
-    item = receipt["Item"]
-    quantity = int(receipt["Quantity"])
-    price = float(receipt["Price"])
-
-    # Сохраняем в базу данных
-    cursor.execute("INSERT INTO receipts (user_id, item, quantity, price) VALUES (?, ?, ?, ?)",
-                   (update.effective_user.id, item, quantity, price))
-    conn.commit()
-
-    await query.message.reply_text(f"✅ Чек сохранен: {item}, {quantity} шт, {price} ₽")
-
-    # Сохраняем данные в базу
+    # Разбираем данные и сохраняем в базу
     for line in structured_data.split("\n"):
-        parts = line.split(",")  # Формат: "Item, Quantity, Price"
-    
+        parts = line.split(",")
+
         if len(parts) != 3:
-            print(f"⚠ Ошибка формата: {line}")  # Логируем ошибочную строку
-            continue  # Пропускаем строку, если формат неверный
+            logging.warning(f"⚠ Ошибка формата: {line}")
+            continue
 
         item, quantity, price = parts
 
         try:
-            quantity = int(quantity.strip())  # Убираем пробелы и конвертируем
-            price = float(price.strip())  # Конвертируем цену
-            cursor.execute("INSERT INTO receipts (user_id, item, quantity, price) VALUES (?, ?, ?, ?)",
-                           (user_id, item.strip(), quantity, price))
-        except ValueError as e:
-            print(f"⚠ Ошибка конвертации: {line} ({e})")  # Показываем, какая строка вызвала ошибку
-            continue  # Пропускаем, если данные некорректны
+            quantity = int(quantity.strip())
+            price = float(price.strip())
 
-    conn.commit()
-    await update.message.reply_text(f"✅ Чек обработан и сохранен!\n\n{structured_data}")
+            cursor.execute("INSERT INTO receipts (user_id, item, quantity, price) VALUES (%s, %s, %s, %s)",
+                           (user_id, item.strip(), quantity, price))
+            conn.commit()
+        except ValueError as e:
+            logging.error(f"⚠ Ошибка конвертации: {line} ({e})")
+            continue
+
+    await message.reply("✅ Чек обработан и сохранен!")
 
 # Экспорт чеков в CSV
-async def export_receipts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+@dp.message_handler(commands=["export"])
+async def export_receipts(message: types.Message):
+    user_id = message.from_user.id
     file_path = f"receipts_{user_id}.csv"
 
-    cursor.execute("SELECT item, quantity, price FROM receipts WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT item, quantity, price FROM receipts WHERE user_id = %s", (user_id,))
     receipts = cursor.fetchall()
 
     if not receipts:
-        await update.message.reply_text("У вас пока нет сохраненных чеков.")
+        await message.reply("У вас пока нет сохраненных чеков.")
         return
 
     with open(file_path, "w", newline="") as f:
@@ -139,21 +146,11 @@ async def export_receipts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         writer.writerow(["Товар", "Количество", "Цена"])
         writer.writerows(receipts)
 
-    await update.message.reply_document(document=open(file_path, "rb"), filename="receipts.csv")
+    await message.reply_document(document=open(file_path, "rb"), filename="receipts.csv")
 
-# Запускаем бота
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("export", export_receipts))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.PHOTO, process_receipt))  # Обрабатываем фото чеков
-    app.add_handler(CommandHandler("form", send_form))
-    app.add_handler(CallbackQueryHandler(handle_webapp_data))
-
-    print("Бот запущен!")
-    app.run_polling()
+# Запуск бота
+async def main():
+    await dp.start_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
